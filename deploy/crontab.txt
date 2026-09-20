@@ -1,0 +1,5 @@
+# No systemd (e.g. some minimal VPS images, Docker) — use cron instead.
+# Install with: crontab deploy/crontab.txt   (edit REPO_DIR first)
+# Runs daily at 9:00am in the server's local timezone — set that with
+# `timedatectl set-timezone America/Chicago` if the box isn't already Central.
+0 9 * * * REPO_DIR=/opt/wholesaler /opt/wholesaler/deploy/run.sh

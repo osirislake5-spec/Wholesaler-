@@ -3,3 +3,5 @@ killed_*.csv
 __pycache__/
 *.pyc
 .env
+logs/
+.venv/

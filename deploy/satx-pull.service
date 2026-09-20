@@ -1,0 +1,9 @@
+[Unit]
+Description=SATX daily wholesale pull (MAO-first)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/wholesaler
+ExecStart=/opt/wholesaler/deploy/run.sh

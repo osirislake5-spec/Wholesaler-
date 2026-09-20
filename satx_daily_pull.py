@@ -13,16 +13,31 @@ WHAT IT DOES, EVERY RUN:
      Anything that fails MAO is written to killed_YYYY-MM-DD.csv with the reason.
 
 WHAT IT DOES NOT DO (be honest with yourself about this):
-  - Zillow and Redfin block plain scrapers. They are NOT pulled here.
-    Pull those by hand, or add a headless browser later.
+  - Zillow (FSBO section) and Redfin are attempted with a headless browser
+    (Playwright/Chromium). CONFIRMED LIVE: both front their sites with
+    Akamai/CloudFront-class bot management that blocks plain headless
+    Chromium outright (403 / "access denied" interstitial) from most
+    datacenter and VPS IPs, before any listing content even loads. This is
+    not a selector problem, and stealth patches are a losing arms race
+    against Akamai/CloudFront. The script detects the block page and says
+    so loudly in stderr ("zillow BLOCKED" / "redfin BLOCKED") instead of
+    quietly reporting 0 rows as if there were no listings.
+    THE FIX: set SCRAPER_PROXY_URL to a residential/ISP proxy or a paid
+    anti-bot scraping API (ScraperAPI, ZenRows, Bright Data — all sell a
+    Playwright-compatible proxy endpoint, ~$30-75/mo starter tiers). Once
+    set, zillow()/redfin() route through it automatically with no other
+    code changes. Until you add one, treat Craigslist + FSBO.com as the
+    reliable daily feed and pull Zillow/Redfin by hand.
   - It cannot get phone numbers. Contact route stays: FSBO.com form,
     Craigslist relay, DSD (210) 207-5422 for code cases, TruePeopleSearch.
   - Zip ARVs below are Zillow zip AVERAGES from 2026-09-20, not comps.
     Update them monthly. A comp from Harold beats any number in this table.
 
 SETUP (once):
-  pip install anthropic requests beautifulsoup4
+  pip install anthropic requests beautifulsoup4 playwright
+  playwright install chromium               (skip on a box that already has it, e.g. PLAYWRIGHT_BROWSERS_PATH set)
   export ANTHROPIC_API_KEY=sk-ant-...     (your $20 of credits lives here)
+  export SCRAPER_PROXY_URL=http://user:pass@host:port   (optional — required for zillow/redfin to actually get through)
 
 RUN (daily, 9am Central — use cron, Replit "Always On", or a $5 VPS):
   python satx_daily_pull.py
@@ -39,6 +54,12 @@ try:
     from anthropic import Anthropic
 except ImportError:
     sys.exit("pip install anthropic")
+
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
 
 # ----------------------------------------------------------------- CONFIG ----
 ASSIGNMENT_FEE = 5000          # your fee in the MAO formula. $2,000 is your floor.
@@ -103,6 +124,122 @@ def fsbo_com():
         print("fsbo.com failed:", e)
     return out
 
+# Zillow and Redfin front their sites with Akamai/CloudFront-class bot
+# management that fingerprints headless Chromium and blocks most
+# datacenter/VPS IPs before any page content loads — confirmed live: a
+# plain headless Playwright run against both got a 403/"access denied"
+# interstitial, not a selector mismatch. A DIY fix (stealth patches,
+# fingerprint spoofing) is a losing arms race against Akamai/CloudFront.
+# The reliable fix is routing through a residential/ISP proxy or a paid
+# anti-bot scraping API (ScraperAPI, ZenRows, Bright Data all offer a
+# Playwright-compatible proxy endpoint). Set SCRAPER_PROXY_URL to one and
+# this code routes through it automatically; without it, expect these two
+# sources to come back empty most days and the script says so loudly
+# instead of pretending "0 results" means "no listings."
+BLOCK_SIGNS = [
+    "access to this page has been denied", "request could not be satisfied",
+    "are you a robot", "captcha", "unusual traffic", "request blocked",
+    "pardon our interruption", "verify you are a human",
+]
+
+def _looks_blocked(page):
+    title = (page.title() or "").lower()
+    try:
+        body = (page.inner_text("body") or "")[:2000].lower()
+    except Exception:
+        body = ""
+    return any(s in title or s in body for s in BLOCK_SIGNS)
+
+def _chromium_launch(pw):
+    """Use a pre-fetched Chromium under PLAYWRIGHT_BROWSERS_PATH if present
+    (e.g. this sandbox); otherwise let Playwright resolve its own default
+    install (a fresh VPS after `playwright install chromium`). Routes
+    through SCRAPER_PROXY_URL (e.g. http://user:pass@host:port from a
+    residential-proxy or anti-bot scraping API vendor) when set."""
+    kwargs = {"headless": True}
+    proxy_url = os.environ.get("SCRAPER_PROXY_URL")
+    if proxy_url:
+        kwargs["proxy"] = {"server": proxy_url}
+    pw_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if pw_path:
+        import glob
+        matches = glob.glob(os.path.join(pw_path, "chromium-*", "chrome-linux", "chrome"))
+        if matches:
+            kwargs["executable_path"] = matches[0]
+    return pw.chromium.launch(**kwargs)
+
+def zillow():
+    """Zillow FSBO section for San Antonio. Headless browser — Zillow blocks
+    plain requests outright, and blocks bare headless Chromium too (see
+    BLOCK_SIGNS note above). Needs SCRAPER_PROXY_URL to get through
+    reliably from most hosting."""
+    if not HAS_PLAYWRIGHT:
+        print("zillow skipped: playwright not installed (pip install playwright && playwright install chromium)")
+        return []
+    out, url = [], "https://www.zillow.com/san-antonio-tx/fsbo/"
+    try:
+        with sync_playwright() as pw:
+            browser = _chromium_launch(pw)
+            page = browser.new_context(user_agent=UA["User-Agent"]).new_page()
+            page.goto(url, timeout=45000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+            if _looks_blocked(page):
+                print(f"zillow BLOCKED (bot check, page title={page.title()!r}) — "
+                      "set SCRAPER_PROXY_URL to a residential proxy/scraping API "
+                      "to get through. This is not '0 listings today'.")
+                browser.close()
+                return out
+            seen = set()
+            for a in page.query_selector_all("a[href*='/homedetails/']"):
+                href = a.get_attribute("href")
+                title = (a.inner_text() or "").strip()
+                if not href or href in seen:
+                    continue
+                seen.add(href)
+                full = href if href.startswith("http") else "https://www.zillow.com" + href
+                out.append({"source":"zillow","title":title or full,"url":full})
+            browser.close()
+    except Exception as e:
+        print("zillow failed:", e)
+    return out
+
+def redfin():
+    """Redfin San Antonio listings. Headless browser — Redfin has no clean
+    FSBO-only filter, so this pulls the general search and leans on the
+    existing is_agent_listed check in main() to kill agent-represented
+    listings during the Claude extraction pass. Also blocks bare headless
+    Chromium at the CDN layer (see BLOCK_SIGNS note above) — needs
+    SCRAPER_PROXY_URL to get through reliably from most hosting."""
+    if not HAS_PLAYWRIGHT:
+        print("redfin skipped: playwright not installed (pip install playwright && playwright install chromium)")
+        return []
+    out, url = [], "https://www.redfin.com/city/30819/TX/San-Antonio"
+    try:
+        with sync_playwright() as pw:
+            browser = _chromium_launch(pw)
+            page = browser.new_context(user_agent=UA["User-Agent"]).new_page()
+            page.goto(url, timeout=45000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+            if _looks_blocked(page):
+                print(f"redfin BLOCKED (bot check, page title={page.title()!r}) — "
+                      "set SCRAPER_PROXY_URL to a residential proxy/scraping API "
+                      "to get through. This is not '0 listings today'.")
+                browser.close()
+                return out
+            seen = set()
+            for a in page.query_selector_all("a[href*='/TX/San-Antonio/']"):
+                href = a.get_attribute("href")
+                title = (a.inner_text() or "").strip()
+                if not href or "/home/" not in href or href in seen:
+                    continue
+                seen.add(href)
+                full = href if href.startswith("http") else "https://www.redfin.com" + href
+                out.append({"source":"redfin","title":title or full,"url":full})
+            browser.close()
+    except Exception as e:
+        print("redfin failed:", e)
+    return out
+
 def fetch_body(url):
     try:
         r = requests.get(url, headers=UA, timeout=30)
@@ -149,7 +286,7 @@ def mao(zipc, damage):
 # --------------------------------------------------------------- MAIN -------
 def main():
     today = date.today().isoformat()
-    raw = craigslist() + fsbo_com()
+    raw = craigslist() + fsbo_com() + zillow() + redfin()
     seen, listings = set(), []
     for l in raw:
         if l["url"] in seen: continue
